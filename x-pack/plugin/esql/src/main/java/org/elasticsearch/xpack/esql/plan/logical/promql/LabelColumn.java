@@ -15,13 +15,13 @@ import java.util.function.UnaryOperator;
 /**
  * One {@code rest} column of a translated table: the packed/dynamic dictionary holding every remaining label.
  * <p>
- * Like ClickHouse, a table carries promoted labels directly plus one {@code rest} per exclusion set; a {@code rest}
- * may overlap the promoted names. Upstream cannot edit a packed column, so the pipeline carries several rests at
- * once (one per exclusion set); a later restriction narrows the set to a single metadata column. {@link SourcePacking}
- * reads {@code _timeseries} variants straight from the source and works on every transport version; the packed JSON
- * record variant lives in the next PR.
+ * Like ClickHouse, a table carries promoted labels directly plus rests; a {@code rest} may overlap the promoted
+ * names. Upstream cannot edit a packed column, so older clusters carry several rests at once (one per exclusion
+ * set). The two implementations cover how the record is read: {@link SourcePacking} reads {@code _timeseries}
+ * variants straight from the source and works on every transport version, while {@link PackedRecord} is the packed
+ * JSON record that newer data nodes understand and edit in place.
  */
-public sealed interface LabelColumn permits SourcePacking {
+public sealed interface LabelColumn permits SourcePacking, PackedRecord {
 
     /** The plan column carrying this record variant. */
     Attribute attribute();

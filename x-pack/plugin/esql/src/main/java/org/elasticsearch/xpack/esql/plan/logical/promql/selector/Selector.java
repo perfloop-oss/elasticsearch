@@ -22,6 +22,8 @@ import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.UnaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.local.EmptyLocalSupplier;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
+import org.elasticsearch.xpack.esql.plan.logical.promql.LabelColumn;
+import org.elasticsearch.xpack.esql.plan.logical.promql.PackedRecord;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PlaceholderRelation;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlPlan;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationConstraint;
@@ -173,6 +175,16 @@ public abstract sealed class Selector extends UnaryPlan implements PromqlPlan pe
             .toList();
         // Expose only required labels that exist on the relation. Consumers null-fill any required label that is absent.
         TranslationConstraint header = project(context.required(), mapFinite(dimensions));
+        Set<LabelColumn> rests = Set.of();
+        if (context.supportsPackedRecords() && header.isOpen()) {
+            // Newer clusters read the whole record once and edit it downstream; older clusters keep one
+            // source-backed rest per exclusion set. The record is created once per relation and shared.
+            TranslationContext.RecordPlan ensured = TranslationContext.ensureRecord(input, source());
+            input = ensured.plan();
+            if (ensured.record() != null) {
+                rests = Set.of(new PackedRecord(ensured.record(), Set.of()));
+            }
+        }
         return new IntermediateResult(
             input,
             header,
@@ -180,7 +192,7 @@ public abstract sealed class Selector extends UnaryPlan implements PromqlPlan pe
             context.stepAttr(),
             matcher,
             TranslationContext.bindPromoted(input, header),
-            Set.of()
+            rests
         );
     }
 }

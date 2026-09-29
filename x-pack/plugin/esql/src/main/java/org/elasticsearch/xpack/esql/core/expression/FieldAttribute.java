@@ -80,6 +80,9 @@ public sealed class FieldAttribute extends TypedAttribute permits TimeSeriesMeta
     public static final TransportVersion ESQL_TIMESERIES_METADATA_ATTRIBUTE = TransportVersion.fromName(
         "esql_timeseries_metadata_attribute"
     );
+    public static final TransportVersion ESQL_TIMESERIES_METADATA_ATTRIBUTE_V2 = TransportVersion.fromName(
+        "esql_timeseries_metadata_attribute_v2"
+    );
 
     private final String parentName;
     private final EsField field;

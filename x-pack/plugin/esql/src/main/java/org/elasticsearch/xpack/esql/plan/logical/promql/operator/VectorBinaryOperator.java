@@ -30,12 +30,14 @@ import org.elasticsearch.xpack.esql.plan.logical.PackDims;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.join.InnerJoin;
 import org.elasticsearch.xpack.esql.plan.logical.promql.LabelColumn;
+import org.elasticsearch.xpack.esql.plan.logical.promql.PackedRecord;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromotedColumn;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlCommand;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlDataType;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlPlan;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationConstraint;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext;
+import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.BoundLabels;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult.Kind;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
@@ -62,6 +64,7 @@ import static org.elasticsearch.xpack.esql.plan.logical.promql.PromqlPlan.getTyp
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationConstraint.finite;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationConstraint.intersect;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationConstraint.open;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationConstraint.subtract;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationConstraint.union;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.emitNullExpression;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.find;
@@ -403,7 +406,7 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         Expression leftValue = probeRight ? build.value() : probe.value();
         Expression rightValue = probeRight ? probe.value() : build.value();
 
-        LogicalPlan join = emitJoin(context.cmd(), probe, build, keyLabels(left, right));
+        LogicalPlan join = emitJoin(context, probe, build, keyLabels(left, right));
         List<NamedExpression> output = bindOutput(header, declared, probe, build);
         var bothRests = new HashSet<>(probe.rests());
         bothRests.addAll(build.rests());
@@ -510,9 +513,10 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
     }
 
     /** The inner join of the two operands on step plus the packed match key. */
-    private LogicalPlan emitJoin(PromqlCommand cmd, IntermediateResult probe, IntermediateResult build, List<String> keyLabels) {
-        Input probeInput = emitInput(cmd, probe, keyLabels);
-        Input buildInput = emitInput(cmd, build, keyLabels);
+    private LogicalPlan emitJoin(TranslationContext context, IntermediateResult probe, IntermediateResult build, List<String> keyLabels) {
+        PromqlCommand cmd = context.cmd();
+        Input probeInput = emitInput(context, probe, keyLabels);
+        Input buildInput = emitInput(context, build, keyLabels);
 
         // The build side carries its join fields plus what the join adds: its value and the group_x labels. Neither can
         // already be a join field (the step, or the freshly packed key), so the two lists are disjoint.
@@ -546,16 +550,43 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
     }
 
     /** One side's plan with its match key defined and packed next to step; step alone when the key is empty. */
-    private Input emitInput(PromqlCommand cmd, IntermediateResult input, List<String> keyLabels) {
+    private Input emitInput(TranslationContext context, IntermediateResult input, List<String> keyLabels) {
+        PromqlCommand cmd = context.cmd();
+        PackedRecord record = context.supportsPackedRecords() ? TranslationContext.findRecord(input.rests()) : null;
+        if (record != null && match.filter() != VectorMatch.Filter.ON) {
+            // Open-schema match: the operand's current record (minus the ignored labels) is the key, with the shared
+            // key labels as its own columns or nulls where the operand lacks them.
+            BoundLabels bound = context.bindLabels(input, subtract(input.header(), match.filterLabels()), cmd.source());
+            assert bound.record() != null : "invariant: binding preserves the operand record";
+            var key = new ArrayList<NamedExpression>();
+            key.add(bound.record().attribute());
+            var nullFills = new ArrayList<Alias>();
+            for (String name : keyLabels) {
+                Attribute attribute = find(bound.plan().output(), name);
+                if (attribute == null) {
+                    Alias nullFill = emitNullExpression(mapToRef(name));
+                    nullFills.add(nullFill);
+                    attribute = nullFill.toAttribute();
+                }
+                key.add(attribute);
+            }
+            LogicalPlan plan = nullFills.isEmpty() ? bound.plan() : new Eval(cmd.source(), bound.plan(), nullFills);
+            return packInput(cmd, input.step(), plan, key);
+        }
         List<NamedExpression> key = joinKey(input, keyLabels);
         List<Alias> nullFills = defined(key);
         LogicalPlan plan = nullFills.isEmpty() ? input.plan() : new Eval(cmd.source(), input.plan(), nullFills);
+        return packInput(cmd, input.step(), plan, key);
+    }
+
+    /** Packs the match key next to step; step alone when the key is empty. */
+    private static Input packInput(PromqlCommand cmd, Attribute step, LogicalPlan plan, List<? extends NamedExpression> key) {
         if (key.isEmpty()) {
-            return new Input(plan, List.of(input.step()));
+            return new Input(plan, List.of(step));
         }
         List<Attribute> keyColumns = key.stream().map(NamedExpression::toAttribute).toList();
         Attribute packed = new ReferenceAttribute(cmd.source(), null, PackDims.PACKED_FIELD_NAME, DataType.KEYWORD);
-        return new Input(new PackDims(cmd.source(), plan, keyColumns, packed), List.of(input.step(), packed));
+        return new Input(new PackDims(cmd.source(), plan, keyColumns, packed), List.of(step, packed));
     }
 
     /**

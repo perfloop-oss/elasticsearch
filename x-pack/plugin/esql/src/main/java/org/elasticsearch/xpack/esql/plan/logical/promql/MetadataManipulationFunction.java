@@ -213,7 +213,7 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
                 }
             }
         }
-        return new IntermediateResult(
+        IntermediateResult table = new IntermediateResult(
             plan,
             header,
             aggregated.value(),
@@ -223,6 +223,8 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
             IntermediateResult.retainPromoted(plan, promoted),
             IntermediateResult.retain(plan, aggregated.rests())
         );
+        // Newer clusters also edit the packed record in place so downstream packed reads agree with the projection.
+        return context.withReplacedLabel(table, name, derived);
     }
 
     /**

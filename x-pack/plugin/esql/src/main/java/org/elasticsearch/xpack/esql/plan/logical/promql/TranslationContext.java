@@ -20,6 +20,7 @@ import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
+import org.elasticsearch.xpack.esql.core.expression.TimeSeriesMetadataAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.Order;
@@ -28,12 +29,16 @@ import org.elasticsearch.xpack.esql.expression.function.aggregate.TimeSeriesAggr
 import org.elasticsearch.xpack.esql.expression.function.aggregate.Values;
 import org.elasticsearch.xpack.esql.expression.function.grouping.TStep;
 import org.elasticsearch.xpack.esql.expression.function.grouping.TimeSeriesWithout;
+import org.elasticsearch.xpack.esql.expression.function.scalar.conditional.Case;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToDatetime;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToDouble;
+import org.elasticsearch.xpack.esql.expression.function.scalar.string.JsonRemovePath;
+import org.elasticsearch.xpack.esql.expression.function.scalar.string.JsonSet;
 import org.elasticsearch.xpack.esql.expression.predicate.logical.And;
 import org.elasticsearch.xpack.esql.expression.predicate.nulls.IsNotNull;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.arithmetic.Add;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.arithmetic.Sub;
+import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.Equals;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.GreaterThanOrEqual;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.LessThanOrEqual;
 import org.elasticsearch.xpack.esql.parser.promql.PromqlLogicalPlanBuilder;
@@ -128,6 +133,14 @@ public record TranslationContext(
         return analyzer.configuration();
     }
 
+    /**
+     * Whether the packed JSON label record may be used here: every node in the cluster must understand the record
+     * edit nodes. Older clusters stay on one {@link SourcePacking} column per exclusion set instead.
+     */
+    public boolean supportsPackedRecords() {
+        return analyzer.minimumVersion().supports(FieldAttribute.ESQL_TIMESERIES_METADATA_ATTRIBUTE_V2);
+    }
+
     public Attribute stepAttr() {
         return stepBucketAlias != null ? stepBucketAlias.toAttribute() : cmd.stepAttribute();
     }
@@ -158,7 +171,7 @@ public record TranslationContext(
         if (branches.size() == 1) {
             IntermediateResult intermediateResult = translateIntermediate(cmd.promqlPlan(), cmd.stepId(), cmd.valueId());
             Attribute declared = find(cmd.output(), mapOpen());
-            LogicalPlan plan = emitTimeSeriesAlias(intermediateResult, declared != null ? declared.id() : new NameId());
+            LogicalPlan plan = emitIdentityAlias(intermediateResult, declared != null ? declared.id() : new NameId());
             return doTranslateFinal(plan, intermediateResult.kind().constant);
         }
         // Compile every branch as its own module (own step/value ids, own shifted evaluation timestamp), then link.
@@ -172,6 +185,18 @@ public record TranslationContext(
     private LogicalPlan doTranslateFinal(LogicalPlan plan, boolean localRelation) {
         plan = emitNullsFilter(cmd.source(), emitFinalProjection(plan), cmd.valueAttribute());
         return localRelation ? plan : emitByStepFilter(plan);
+    }
+
+    /**
+     * A finished table exposes its series identity under the canonical {@code _timeseries} name. A packed record is
+     * already canonical, so it passes through; legacy packings travel under their derived names so nodes can tell
+     * them apart, and the one surviving at a root is declared as {@code _timeseries} here.
+     */
+    private LogicalPlan emitIdentityAlias(IntermediateResult table, NameId id) {
+        if (findRecord(table.rests()) != null) {
+            return table.plan();
+        }
+        return emitTimeSeriesAlias(table, id);
     }
 
     /**
@@ -208,7 +233,7 @@ public record TranslationContext(
         for (int i = 0; i < intermediateResults.size(); i++) {
             // Drop null-valued rows per branch so an absent left side does not shadow a present right side.
             var ir = intermediateResults.get(i);
-            LogicalPlan branchPlan = emitNullsFilter(source, emitTimeSeriesAlias(ir, new NameId()), ir.valueColumn());
+            LogicalPlan branchPlan = emitNullsFilter(source, emitIdentityAlias(ir, new NameId()), ir.valueColumn());
             var branchTagExpression = new Alias(source, cmd.branchColumnName(), new Literal(source, i, DataType.INTEGER));
             LogicalPlan tagged = new Eval(source, branchPlan, List.of(branchTagExpression));
             // Each branch executes as an independent sub plan whose result pages cross an exchange, and the
@@ -294,6 +319,7 @@ public record TranslationContext(
         Attribute stepAttr = cmd.stepAttribute();
         if (result.kind().constant
             || cmd.start().value() == null
+            || findRecord(result.rests()) != null
             || result.value().references().stream().allMatch(ref -> ref.semanticEquals(stepAttr)) == false) {
             return result;
         }
@@ -317,7 +343,8 @@ public record TranslationContext(
     }
 
     /**
-     * The table a {@code without} regroup exposes: the child columns surviving the dropped labels. A finite
+     * The table a {@code without} regroup exposes: the child columns surviving the dropped labels. Under a packed
+     * column the labels are derived columns, so only those the enclosing translation asks for are carried; a finite
      * child keeps every remaining label because they are its label set.
      */
     public TranslationConstraint regroupWithout(TranslationConstraint child, List<String> keys) {
@@ -334,7 +361,7 @@ public record TranslationContext(
     public IntermediateResult collapse(IntermediateResult input, TranslationConstraint header, Expression function) {
         assert input.kind().afterInitialAggregation == false : "invariant: a collapse takes a raw table";
         Alias value = new Alias(function.source(), cmd.valueColumnName(), function);
-        return emitLegacyCollapse(input, header, value);
+        return emitCollapse(input, header, value);
     }
 
     /**
@@ -344,7 +371,251 @@ public record TranslationContext(
     public IntermediateResult regroup(IntermediateResult input, TranslationConstraint header, boolean packed, Expression function) {
         assert input.kind().afterInitialAggregation : "invariant: a regroup takes a collapsed table";
         Alias value = new Alias(function.source(), cmd.valueColumnName(), function);
-        return emitLegacyRegroup(input, header, value, header.isOpen() || packed);
+        return emitRegroup(input, header, value, header.isOpen() || packed);
+    }
+
+    /** The single packed record in a rest set, or null when the table carries none (legacy or label-free). */
+    public static PackedRecord findRecord(Set<LabelColumn> rests) {
+        PackedRecord record = null;
+        for (LabelColumn rest : rests) {
+            if (rest instanceof PackedRecord packed) {
+                assert record == null : "invariant: a table carries at most one packed record";
+                record = packed;
+            }
+        }
+        return record;
+    }
+
+    /** A table's labels resolved against its plan: grouping keys plus the current record, if any. */
+    public record BoundLabels(LogicalPlan plan, List<Attribute> keys, PackedRecord record) {}
+
+    /** A plan with its complete record materialized in the source relations, or a null record when skipped. */
+    public record RecordPlan(LogicalPlan plan, TimeSeriesMetadataAttribute record) {}
+
+    /**
+     * The complete record for the source relations under a plan, creating it where absent. Creation is skipped
+     * under joins: a record added below a join would not surface in the join output. Callers track the record
+     * only when non-null.
+     */
+    public static RecordPlan ensureRecord(LogicalPlan plan, Source source) {
+        if (plan.anyMatch(p -> p instanceof InnerJoin)) {
+            return new RecordPlan(plan, null);
+        }
+        var found = new TimeSeriesMetadataAttribute[1];
+        LogicalPlan next = plan.transformUp(EsRelation.class, relation -> {
+            Attribute existing = relation.output()
+                .stream()
+                .filter(a -> a instanceof TimeSeriesMetadataAttribute metadata && metadata.excludedFields().isEmpty())
+                .findFirst()
+                .orElse(null);
+            if (existing != null) {
+                if (found[0] == null) {
+                    found[0] = (TimeSeriesMetadataAttribute) existing;
+                }
+                return relation;
+            }
+            var created = new TimeSeriesMetadataAttribute(source, Set.of());
+            if (found[0] == null) {
+                found[0] = created;
+            }
+            return relation.withAdditionalAttributes(List.of(created));
+        });
+        return new RecordPlan(next, found[0]);
+    }
+
+    /**
+     * Selects grouping labels from the current table. An open selection projects the current record, pushing new
+     * exclusions into the loader when it is still source-backed and applying an ordinary JSON edit otherwise. A named
+     * selection resolves concrete columns, null-filling labels the table does not carry.
+     */
+    public BoundLabels bindLabels(IntermediateResult input, TranslationConstraint header, Source source) {
+        LogicalPlan plan = input.plan();
+        var definitions = new ArrayList<Alias>();
+        var keys = new ArrayList<Attribute>();
+        PackedRecord record = findRecord(input.rests());
+        if (header.isOpen() && record != null) {
+            var removed = new LinkedHashSet<String>();
+            for (Set<String> skip : header.skips()) {
+                removed.addAll(skip);
+            }
+            removed.removeAll(header.labels());
+            removed.removeAll(record.excluded());
+            if (removed.isEmpty() == false) {
+                if (record.attribute() instanceof TimeSeriesMetadataAttribute stored) {
+                    // Push a direct source projection into the existing loader. Replace this record instead of adding
+                    // another exclusion variant. Computed records use the ordinary JSON expression below and never
+                    // read the original source again.
+                    var excluded = new LinkedHashSet<>(stored.excludedFields());
+                    excluded.addAll(removed);
+                    Attribute projected = new TimeSeriesMetadataAttribute(source, excluded);
+                    plan = plan.transformExpressionsUp(Attribute.class, a -> a.id().equals(stored.id()) ? projected : a);
+                    var next = new LinkedHashSet<>(record.excluded());
+                    next.addAll(removed);
+                    record = new PackedRecord(projected, next);
+                } else {
+                    Alias updated = new Alias(source, MetadataAttribute.TIMESERIES, excludeLabels(plan, record.attribute(), removed));
+                    definitions.add(updated);
+                    var next = new LinkedHashSet<>(record.excluded());
+                    next.addAll(removed);
+                    record = new PackedRecord(updated.toAttribute(), next);
+                }
+            }
+        }
+        for (String name : header.labels()) {
+            Attribute carrier = find(plan.output(), name);
+            if (carrier == null) {
+                // a declared label the table lacks is absent from every series: grouped under null, like Prometheus
+                Alias projection = new Alias(source, name, new Literal(source, null, DataType.KEYWORD));
+                definitions.add(projection);
+                carrier = projection.toAttribute();
+            }
+            keys.add(carrier);
+        }
+        if (definitions.isEmpty() == false) {
+            plan = new Eval(source, plan, definitions);
+        }
+        return new BoundLabels(plan, keys, record);
+    }
+
+    /**
+     * Projects an exclusion edit over a packed record: the whole member key plus, for dotted names, the nested path,
+     * addressing stored field names that themselves contain dots.
+     */
+    private Expression excludeLabels(LogicalPlan plan, Attribute record, Collection<String> names) {
+        var fields = new LinkedHashSet<String>();
+        for (String name : names) {
+            fields.add(name);
+            fields.add(PromqlLabels.PROMETHEUS_LABELS_PREFIX + name);
+            Attribute stored = find(cmd.child().output(), name);
+            if (stored instanceof FieldAttribute field) {
+                fields.add(field.fieldName().string());
+            }
+        }
+        Source source = plan.source();
+        var children = new ArrayList<Expression>();
+        children.add(record);
+        for (String field : fields) {
+            children.addAll(memberPaths(source, field));
+        }
+        return new JsonRemovePath(source, children);
+    }
+
+    /** Bracket-quotes one member name for a JSON path literal. */
+    private static String quotedMember(String name) {
+        return "[\"" + name.replace("\\", "\\\\").replace("\"", "\\\"") + "\"]";
+    }
+
+    /** Path literals addressing one packed-record field, as a whole key and — for dotted names — as a nested path. */
+    private static List<Expression> memberPaths(Source source, String field) {
+        if (field.indexOf('.') == -1) {
+            return List.of(Literal.keyword(source, "$" + quotedMember(field)));
+        }
+        var nested = new StringBuilder("$");
+        for (String segment : field.split("\\.", -1)) {
+            nested.append(quotedMember(segment));
+        }
+        return List.of(Literal.keyword(source, "$" + quotedMember(field)), Literal.keyword(source, nested.toString()));
+    }
+
+    /**
+     * Keeps a relabel's named projection and complete record in agreement. The destination column must already be
+     * defined in the input plan; only the record edit is added here. Empty results mean removal in PromQL, expressed
+     * with Case here; the JSON functions themselves retain empty strings and nulls.
+     */
+    public IntermediateResult withReplacedLabel(IntermediateResult input, String name, Alias destination) {
+        PackedRecord record = findRecord(input.rests());
+        if (record == null) {
+            return input;
+        }
+        Source source = destination.source();
+        Expression removed = excludeLabels(input.plan(), record.attribute(), List.of(name));
+        Expression updated = new JsonSet(
+            source,
+            List.of(removed, Literal.keyword(source, "$" + quotedMember(name)), destination.toAttribute())
+        );
+        Expression absent = new Equals(source, destination.toAttribute(), Literal.keyword(source, ""));
+        Alias edited = new Alias(source, MetadataAttribute.TIMESERIES, new Case(source, absent, List.of(removed, updated)));
+        LogicalPlan plan = new Eval(source, input.plan(), List.of(edited));
+        Set<LabelColumn> rests = new LinkedHashSet<>(input.rests());
+        rests.remove(record);
+        rests.add(new PackedRecord(edited.toAttribute(), record.excluded()));
+        return input.with(plan, input.header(), input.value(), input.promoted(), Set.copyOf(rests));
+    }
+
+    /**
+     * The innermost aggregate groups on the child's already-defined columns. Newer clusters group on the packed
+     * record; older clusters materialize one source-backed packing per skip set in the header instead.
+     */
+    private IntermediateResult emitCollapse(IntermediateResult input, TranslationConstraint header, Alias value) {
+        if (supportsPackedRecords()) {
+            return emitPackedCollapse(input, header, value);
+        }
+        return emitLegacyCollapse(input, header, value);
+    }
+
+    /**
+     * The packed innermost aggregate: the record (when the table carries one) groups the series under a public
+     * reference rather than leaking the storage-only metadata attribute, and named labels resolve as columns.
+     * No {@code TimeSeriesWithout} packing is emitted, so the lowering rule leaves the source relation alone.
+     */
+    private IntermediateResult emitPackedCollapse(IntermediateResult input, TranslationConstraint header, Alias value) {
+        Source source = cmd.promqlPlan().source();
+        Expression agg = value.child();
+        // Same phase-2 guard as the legacy collapse: without any series grouping (e.g. constants like vector(5))
+        // TranslateTimeSeriesAggregate passes Literals straight to phase 1.
+        boolean groupsBySeries = header.isOpen() || header.labels().isEmpty() == false;
+        boolean wrapWithValues = (agg instanceof AggregateFunction == false) || (agg instanceof TimeSeriesAggregateFunction);
+        if (groupsBySeries && wrapWithValues) {
+            value = value.replaceChild(new Values(agg.source(), agg));
+        }
+
+        if (findRecord(input.rests()) == null && header.isOpen()) {
+            // The record was dropped upstream (a scalar operand's plan) or the leaf was label-free: materialize it
+            // so the open collapse groups on the series identity the final projection exposes.
+            RecordPlan ensured = ensureRecord(input.plan(), source);
+            if (ensured.record() != null) {
+                var carried = new LinkedHashSet<>(input.rests());
+                carried.add(new PackedRecord(ensured.record(), Set.of()));
+                input = input.with(
+                    ensured.plan(),
+                    input.header(),
+                    input.value(),
+                    IntermediateResult.retainPromoted(ensured.plan(), input.promoted()),
+                    Set.copyOf(carried)
+                );
+            }
+        }
+        BoundLabels bound = bindLabels(input, header, source);
+        var groupKeys = new ArrayList<NamedExpression>();
+        Set<LabelColumn> rests = Set.of();
+        if (bound.record() != null) {
+            // Keep the public record as a reference rather than leaking the storage-only metadata attribute.
+            PackedRecord record = bound.record();
+            Alias alias = new Alias(source, record.attribute().name(), record.attribute(), record.attribute().id());
+            groupKeys.add(alias);
+            rests = Set.of(new PackedRecord(alias.toAttribute(), record.excluded()));
+        }
+        groupKeys.addAll(bound.keys());
+        List<Attribute> output = groupKeys.stream().map(NamedExpression::toAttribute).toList();
+        var collapsed = new TimeSeriesAggregate(
+            source,
+            bound.plan(),
+            groupings(stepBucketAlias, groupKeys),
+            aggregates(value, input.step(), output),
+            null,
+            time,
+            TimeSeriesAggregate.Origin.PROMQL_COMMAND
+        );
+        return new IntermediateResult(
+            collapsed,
+            header,
+            value.toAttribute(),
+            input.step(),
+            input.pendingFilter(),
+            Kind.AFTER_INITIAL_AGGREGATE,
+            bindPromoted(collapsed, header),
+            rests
+        );
     }
 
     /**
@@ -420,6 +691,97 @@ public record TranslationContext(
      * grouping columns. A packed regroup additionally packs dimensions before aggregation to prevent multi-valued
      * dimensions from splitting rows and double-counting, then unpacks them afterwards.
      */
+    private IntermediateResult emitRegroup(IntermediateResult input, TranslationConstraint header, Alias value, boolean requiresPacking) {
+        if (supportsPackedRecords()) {
+            return emitPackedRegroup(input, header, value, requiresPacking);
+        }
+        return emitLegacyRegroup(input, header, value, requiresPacking);
+    }
+
+    /**
+     * The packed regroup resolves its keys against the record and null-fills missing grouping columns. A packed
+     * regroup additionally packs dimensions before aggregation to prevent multi-valued dimensions from splitting rows
+     * and double-counting, then unpacks them afterwards; the record travels through the packing under its own id.
+     */
+    private IntermediateResult emitPackedRegroup(
+        IntermediateResult input,
+        TranslationConstraint header,
+        Alias value,
+        boolean requiresPacking
+    ) {
+        Source source = cmd.source();
+        Attribute step = input.step();
+        if (value.child() instanceof AggregateFunction == false) {
+            value = value.replaceChild(new Values(value.child().source(), value.child()));
+        }
+        BoundLabels bound = bindLabels(input, header, source);
+        LogicalPlan plan = bound.plan();
+        var keyAttributes = new ArrayList<Attribute>(bound.keys());
+        if (bound.record() != null) {
+            keyAttributes.add(bound.record().attribute());
+        }
+
+        // TranslateTimeSeriesAggregate unpacks the inner TSA's dimensions and this regroup re-packs them.
+        if (requiresPacking == false || keyAttributes.isEmpty()) {
+            plan = new Aggregate(source, plan, groupings(step, keyAttributes), aggregates(value, step, keyAttributes));
+            return regrouped(plan, input, header, value, bound.record());
+        }
+        Attribute packedAttribute = PackDims.newPackedAttribute(source);
+        PackDims packDims = new PackDims(source, plan, keyAttributes, packedAttribute);
+        Alias packedGrouping = PackDims.newPackedGrouping(source, packedAttribute);
+        Aggregate agg = new Aggregate(
+            source,
+            packDims,
+            groupings(step, List.of(packedGrouping)),
+            aggregates(value, step, List.of(packedGrouping.toAttribute()))
+        );
+        List<Attribute> unpackedDims = keyAttributes.stream()
+            .<Attribute>map(
+                dim -> new ReferenceAttribute(dim.source(), null, dim.name(), dim.dataType().noText(), Nullability.TRUE, dim.id(), false)
+            )
+            .toList();
+        UnpackDims unpackDims = new UnpackDims(source, agg, packedGrouping.toAttribute(), unpackedDims);
+        List<NamedExpression> projections = new ArrayList<>(List.of(value.toAttribute(), step));
+        projections.addAll(unpackedDims);
+        LogicalPlan projected = new Project(source, unpackDims, projections);
+        PackedRecord record = null;
+        if (bound.record() != null) {
+            Attribute reunpacked = null;
+            for (Attribute unpacked : unpackedDims) {
+                if (unpacked.id().equals(bound.record().attribute().id())) {
+                    reunpacked = unpacked;
+                }
+            }
+            assert reunpacked != null : "invariant: the packed record travels through the regroup packing";
+            record = new PackedRecord(reunpacked, bound.record().excluded());
+        }
+        return regrouped(projected, input, header, value, record);
+    }
+
+    /**
+     * The regrouped packed table binds its promoted labels from the regrouped plan and carries exactly its current
+     * record; the legacy regroup instead retains whatever input rests survive in the regrouped plan.
+     */
+    private static IntermediateResult regrouped(
+        LogicalPlan plan,
+        IntermediateResult input,
+        TranslationConstraint header,
+        Alias value,
+        PackedRecord record
+    ) {
+        Set<LabelColumn> rests = record == null ? IntermediateResult.retain(plan, input.rests()) : Set.of(record);
+        return new IntermediateResult(
+            plan,
+            header,
+            value.toAttribute(),
+            input.step(),
+            input.pendingFilter(),
+            Kind.AFTER_INITIAL_AGGREGATE,
+            bindPromoted(plan, header),
+            rests
+        );
+    }
+
     private IntermediateResult emitLegacyRegroup(
         IntermediateResult input,
         TranslationConstraint header,
@@ -486,7 +848,8 @@ public record TranslationContext(
 
     /**
      * The regrouped table binds its promoted labels from the regrouped plan and keeps the input's rests that survive
-     * in it. Regroups genuinely drop columns, so survivors are retained rather than propagated.
+     * in it. Regroups genuinely drop columns (a packed regroup projects its rests away), so survivors are retained
+     * rather than propagated.
      */
     private static IntermediateResult regrouped(LogicalPlan plan, IntermediateResult input, TranslationConstraint header, Alias value) {
         return new IntermediateResult(
@@ -567,10 +930,28 @@ public record TranslationContext(
             }
             var offset = cmd.collectFirstOffsetForBranch(branch);
             var shifted = offset.isZero() ? base : new Add(cmd.source(), base, Literal.timeDuration(cmd.source(), offset), configuration());
-            var time = new Alias(cmd.source(), cmd.timestampColumnName(), shifted, ref.id());
-            return plan.transformUp(node -> node == cmd.child(), node -> new Eval(cmd.source(), node, List.of(time)));
+            var timestamp = new Alias(cmd.source(), cmd.timestampColumnName(), shifted, ref.id());
+            if (supportsPackedRecords()) {
+                return addEvaluationTimestamp(plan, timestamp);
+            }
+            return plan.transformUp(node -> node == cmd.child(), node -> new Eval(cmd.source(), node, List.of(timestamp)));
         }
         return plan;
+    }
+
+    /**
+     * Defines the evaluation timestamp over the branch's source. Structural instead of identity-based: record
+     * creation replaces the source relation instance during translation, so matching {@code cmd.child()} by identity
+     * would miss it. Joined operands already own their evaluation times; only visit this branch's source.
+     */
+    private LogicalPlan addEvaluationTimestamp(LogicalPlan plan, Alias timestamp) {
+        if (plan instanceof InnerJoin) {
+            return plan;
+        }
+        if (plan instanceof EsRelation) {
+            return new Eval(cmd.source(), plan, List.of(timestamp));
+        }
+        return plan.replaceChildren(plan.children().stream().map(child -> addEvaluationTimestamp(child, timestamp)).toList());
     }
 
     /** Pushes the label filter down to the EsRelation, combining with an existing relation filter. */
@@ -710,6 +1091,11 @@ public record TranslationContext(
             assert rests.stream().map(LabelColumn::attribute).allMatch(a -> plan.outputSet().contains(a))
                 : "every rest column must belong to the plan output";
             // No disjointness check: a rest may overlap the promoted names.
+            // Singleton enforcement: a table with the packed record carries no source packings. Older clusters
+            // never create the record (they stay on one rest per exclusion set); newer clusters never emit
+            // packings, so the record is always the only rest.
+            assert findRecord(rests) == null || rests.stream().noneMatch(SourcePacking.class::isInstance)
+                : "the packed record never mixes with source packings";
         }
 
         /** A raw input whose value may still contain per-series aggregate expressions. */
