@@ -15,12 +15,13 @@ import java.util.Set;
 
 /**
  * The existing label requirements and available columns, shared by parent and child translations.
- * Labels required by name, optionally together with packed columns each excluding a set of names.
+ * Promoted labels required by name, optionally together with {@code rest} columns each excluding a set of names.
  * This is a selection, not an inventory of storage projections: combining requirements only combines
- * their label names and exclusion sets, without creating physical record projections.
+ * their label names and exclusion sets, without creating physical record projections. A {@code rest} may
+ * overlap the promoted names.
  *
- * @param labels concrete label reads
- * @param skips exclusion sets, one per packed column
+ * @param labels promoted label reads
+ * @param skips exclusion sets, one per {@code rest} column
  */
 public record TranslationConstraint(Set<String> labels, Set<Set<String>> skips) {
     /** No columns: a scalar's constraint, and the identity of {@link #union}. */

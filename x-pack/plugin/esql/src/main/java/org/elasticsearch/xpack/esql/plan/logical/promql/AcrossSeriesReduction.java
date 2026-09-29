@@ -143,7 +143,13 @@ public final class AcrossSeriesReduction extends PromqlFunctionCall {
             ? context.regroup(childResult, header, false, childResult.value())
             : context.collapse(childResult, header, childResult.value());
         LogicalPlan result = emitTopNBy(context, aggregated, partitions, promqlCtx);
-        return aggregated.with(result, aggregated.header(), aggregated.value());
+        return aggregated.with(
+            result,
+            aggregated.header(),
+            aggregated.value(),
+            TranslationContext.bindPromoted(result, aggregated.header()),
+            IntermediateResult.retain(result, aggregated.rests())
+        );
     }
 
     /** Ranks the already-collapsed per-series rows and keeps the top {@code k} within each step and partition. */

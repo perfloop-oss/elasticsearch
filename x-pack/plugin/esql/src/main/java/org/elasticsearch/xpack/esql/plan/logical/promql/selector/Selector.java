@@ -32,6 +32,7 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.Inter
 import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationConstraint.project;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.find;
@@ -130,7 +131,16 @@ public abstract sealed class Selector extends UnaryPlan implements PromqlPlan pe
             if (foldedPlan != null) {
                 // a compile-time relation carries its own step column
                 Attribute foldedStep = find(foldedPlan.output(), context.cmd().stepColumnName());
-                return new IntermediateResult(foldedPlan, TranslationConstraint.EMPTY, literal, foldedStep, matcher, Kind.CONSTANT);
+                return new IntermediateResult(
+                    foldedPlan,
+                    TranslationConstraint.EMPTY,
+                    literal,
+                    foldedStep,
+                    matcher,
+                    Kind.CONSTANT,
+                    Set.of(),
+                    Set.of()
+                );
             }
             return new IntermediateResult(input, TranslationConstraint.EMPTY, literal, context.stepAttr(), matcher);
         }
@@ -146,7 +156,9 @@ public abstract sealed class Selector extends UnaryPlan implements PromqlPlan pe
                 Literal.NULL,
                 context.cmd().stepAttribute(),
                 null,
-                Kind.CONSTANT
+                Kind.CONSTANT,
+                Set.of(),
+                Set.of()
             );
         }
 
@@ -161,6 +173,14 @@ public abstract sealed class Selector extends UnaryPlan implements PromqlPlan pe
             .toList();
         // Expose only required labels that exist on the relation. Consumers null-fill any required label that is absent.
         TranslationConstraint header = project(context.required(), mapFinite(dimensions));
-        return new IntermediateResult(input, header, expr, context.stepAttr(), matcher);
+        return new IntermediateResult(
+            input,
+            header,
+            expr,
+            context.stepAttr(),
+            matcher,
+            TranslationContext.bindPromoted(input, header),
+            Set.of()
+        );
     }
 }

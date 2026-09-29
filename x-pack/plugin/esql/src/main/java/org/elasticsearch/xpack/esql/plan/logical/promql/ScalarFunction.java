@@ -23,6 +23,7 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.Inter
 import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Represents a PromQL function call that produces a scalar value and has no arguments.
@@ -110,6 +111,14 @@ public final class ScalarFunction extends LeafPlan implements PromqlPlan {
         var function = buildEsqlFunction(
             new PromqlContext(context.cmd().timestamp(), null, context.cmd().stepAttribute(), context.configuration())
         );
-        return new IntermediateResult(context.cmd().child(), TranslationConstraint.EMPTY, function, context.stepAttr());
+        return new IntermediateResult(
+            context.cmd().child(),
+            TranslationConstraint.EMPTY,
+            function,
+            context.stepAttr(),
+            (Expression) null,
+            Set.of(),
+            Set.of()
+        );
     }
 }

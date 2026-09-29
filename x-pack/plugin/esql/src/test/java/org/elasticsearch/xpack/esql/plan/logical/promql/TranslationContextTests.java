@@ -9,10 +9,14 @@ package org.elasticsearch.xpack.esql.plan.logical.promql;
 
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.plan.logical.local.EmptyLocalSupplier;
+import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
+import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
 
 import java.util.List;
 import java.util.Set;
@@ -95,6 +99,65 @@ public class TranslationContextTests extends ESTestCase {
         assertThat(TranslationContext.find(List.of(bare, packed), TranslationContext.mapOpen(Set.of("pod"))), sameInstance(packed));
         assertNull(TranslationContext.find(List.of(bare), "pod"));
         assertThat(TranslationContext.mapFinite(List.of(bare, prefixed, attr("pod"))), contains("cluster", "pod"));
+    }
+
+    public void testUnionAllowsRestToOverlapPromoted() {
+        TranslationConstraint header = union(finite(List.of("pod")), open(Set.of()));
+
+        assertThat(header.labels(), contains("pod"));
+        assertThat(header.skips(), contains(Set.of()));
+    }
+
+    public void testMultipleRestsCoexist() {
+        TranslationConstraint header = union(open(Set.of()), open(Set.of("pod")));
+
+        assertThat(header.skips(), containsInAnyOrder(Set.of(), Set.of("pod")));
+        assertThat(header.finestSkip(), equalTo(Set.of()));
+    }
+
+    public void testBindPromotedOmitsMissingAndPreservesOrder() {
+        Attribute pod = attr("pod");
+        Attribute region = attr("region");
+        var plan = new LocalRelation(Source.EMPTY, List.of(pod, region), EmptyLocalSupplier.EMPTY);
+        TranslationConstraint header = finite(List.of("region", "pod", "missing"));
+
+        Set<PromotedColumn> promoted = TranslationContext.bindPromoted(plan, header);
+
+        assertThat(promoted.stream().map(PromotedColumn::name).toList(), contains("region", "pod"));
+        assertThat(promoted.stream().filter(c -> c.name().equals("pod")).findFirst().orElseThrow().attribute(), sameInstance(pod));
+        assertThat(promoted.stream().filter(c -> c.name().equals("region")).findFirst().orElseThrow().attribute(), sameInstance(region));
+    }
+
+    public void testIntermediateResultAllowsOverlapAndRetainsSurvivors() {
+        Attribute pod = attr("pod");
+        Attribute rest = attr(TranslationContext.mapOpen(Set.of()));
+        Attribute step = attr("step");
+        var plan = new LocalRelation(Source.EMPTY, List.of(pod, rest, step), EmptyLocalSupplier.EMPTY);
+        TranslationConstraint header = union(finite(List.of("pod")), open(Set.of()));
+        var table = new IntermediateResult(
+            plan,
+            header,
+            Literal.NULL,
+            step,
+            null,
+            IntermediateResult.Kind.AFTER_INITIAL_AGGREGATE,
+            Set.of(new PromotedColumn("pod", pod)),
+            Set.of(new SourcePacking(rest, Set.of()))
+        );
+
+        assertThat(table.label("pod"), sameInstance(pod));
+        assertThat(table.packed(Set.of()), sameInstance(rest));
+
+        var withoutRest = new LocalRelation(Source.EMPTY, List.of(pod, step), EmptyLocalSupplier.EMPTY);
+        assertThat(
+            IntermediateResult.retainPromoted(withoutRest, table.promoted()).stream().map(PromotedColumn::name).toList(),
+            contains("pod")
+        );
+        assertTrue(IntermediateResult.retain(withoutRest, table.rests()).isEmpty());
+
+        var withoutPromoted = new LocalRelation(Source.EMPTY, List.of(rest, step), EmptyLocalSupplier.EMPTY);
+        assertTrue(IntermediateResult.retainPromoted(withoutPromoted, table.promoted()).isEmpty());
+        assertThat(IntermediateResult.retain(withoutPromoted, table.rests()).size(), equalTo(1));
     }
 
     private static Attribute attr(String name) {

@@ -29,6 +29,8 @@ import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.PackDims;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.join.InnerJoin;
+import org.elasticsearch.xpack.esql.plan.logical.promql.LabelColumn;
+import org.elasticsearch.xpack.esql.plan.logical.promql.PromotedColumn;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlCommand;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlDataType;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlPlan;
@@ -42,6 +44,7 @@ import org.elasticsearch.xpack.esql.session.Configuration;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -50,6 +53,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.stream.Collectors;
 
 import static org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction.withFilter;
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAndNullable;
@@ -336,7 +340,28 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         Kind kind = left.kind().afterInitialAggregation || right.kind().afterInitialAggregation
             ? Kind.AFTER_INITIAL_AGGREGATE
             : Kind.BEFORE_INITIAL_AGGREGATE;
-        IntermediateResult result = new IntermediateResult(plan, shape, null, left.step(), filter, kind);
+        var bothRests = new HashSet<>(left.rests());
+        bothRests.addAll(right.rests());
+        var bothPromoted = new LinkedHashSet<>(left.promoted());
+        var seen = new HashSet<String>();
+        for (PromotedColumn column : left.promoted()) {
+            seen.add(column.name());
+        }
+        for (PromotedColumn column : right.promoted()) {
+            if (seen.add(column.name())) {
+                bothPromoted.add(column);
+            }
+        }
+        IntermediateResult result = new IntermediateResult(
+            plan,
+            shape,
+            null,
+            left.step(),
+            filter,
+            kind,
+            IntermediateResult.retainPromoted(plan, bothPromoted),
+            IntermediateResult.retain(plan, bothRests)
+        );
         return context.eval(result, binaryExpr);
     }
 
@@ -380,7 +405,9 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
 
         LogicalPlan join = emitJoin(context.cmd(), probe, build, keyLabels(left, right));
         List<NamedExpression> output = bindOutput(header, declared, probe, build);
-        return bindResult(context, header, leftValue, rightValue, probe.step(), join, output);
+        var bothRests = new HashSet<>(probe.rests());
+        bothRests.addAll(build.rests());
+        return bindResult(context, header, leftValue, rightValue, probe.step(), join, output, bothRests);
     }
 
     /**
@@ -411,7 +438,8 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         Expression rightValue,
         Attribute step,
         LogicalPlan join,
-        List<NamedExpression> output
+        List<NamedExpression> output,
+        Set<LabelColumn> rests
     ) {
         PromqlCommand cmd = context.cmd();
         Expression lhsExpr = new ToDouble(leftValue.source(), leftValue);
@@ -436,7 +464,16 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         output.forEach(column -> projected.add(column.toAttribute()));
         plan = new Project(cmd.source(), plan, projected);
 
-        return new IntermediateResult(plan, header, valueAlias.toAttribute(), stepAlias.toAttribute(), null, Kind.AFTER_INITIAL_AGGREGATE);
+        return new IntermediateResult(
+            plan,
+            header,
+            valueAlias.toAttribute(),
+            stepAlias.toAttribute(),
+            null,
+            Kind.AFTER_INITIAL_AGGREGATE,
+            TranslationContext.bindPromoted(plan, header),
+            IntermediateResult.retain(plan, rests)
+        );
     }
 
     /**
@@ -452,7 +489,24 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
             .transformExpressionsDown(Expression.class, e -> reidExpr(renamed(e, cmd.valueColumnName(), valueName), ids));
         Expression value = reidExpr(renamed(input.valueColumn(), cmd.valueColumnName(), valueName), ids);
         Attribute step = (Attribute) reidExpr(input.step(), ids);
-        return new IntermediateResult(plan, input.header(), value, step, input.pendingFilter(), input.kind());
+        var promoted = new LinkedHashSet<PromotedColumn>();
+        for (PromotedColumn column : input.promoted()) {
+            promoted.add(column.remap(attr -> (Attribute) reidExpr(attr, ids)));
+        }
+        Set<LabelColumn> rests = input.rests()
+            .stream()
+            .map(column -> column.remap(attr -> (Attribute) reidExpr(attr, ids)))
+            .collect(Collectors.toUnmodifiableSet());
+        return new IntermediateResult(
+            plan,
+            input.header(),
+            value,
+            step,
+            input.pendingFilter(),
+            input.kind(),
+            Collections.unmodifiableSet(promoted),
+            rests
+        );
     }
 
     /** The inner join of the two operands on step plus the packed match key. */

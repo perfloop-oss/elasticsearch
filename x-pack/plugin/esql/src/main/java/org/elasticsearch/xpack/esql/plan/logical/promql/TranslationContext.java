@@ -62,11 +62,14 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.stream.Collectors;
 
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAndNullable;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.PromqlLabels.PROMETHEUS_LABELS_PREFIX;
@@ -251,6 +254,8 @@ public record TranslationContext(
             plan = pushDownSrcTimestampFilter(plan, filter);
         }
 
+        Set<PromotedColumn> promoted = ir.promoted();
+        Set<LabelColumn> rests = ir.rests();
         if (ir.kind().constant == false) {
             // TimeSeriesAggregate always applies because InstantSelectors adds implicit last_over_time().
             // TODO: with metric references without last_over_time, a plain Aggregate could do (#141501 discussion).
@@ -258,6 +263,8 @@ public record TranslationContext(
                 IntermediateResult collapsed = collapse(ir.with(plan, ir.header(), value), ir.header(), value);
                 plan = collapsed.plan();
                 value = collapsed.value();
+                promoted = collapsed.promoted();
+                rests = collapsed.rests();
             }
             if (branch instanceof VectorBinaryComparison comparison && comparison.filterMode()) {
                 VectorMatch match = comparison.match();
@@ -279,7 +286,7 @@ public record TranslationContext(
         }
 
         Kind kind = ir.kind().constant ? Kind.CONSTANT : Kind.AFTER_INITIAL_AGGREGATE;
-        return new IntermediateResult(plan, ir.header(), valueAlias.toAttribute(), ir.step(), null, kind);
+        return new IntermediateResult(plan, ir.header(), valueAlias.toAttribute(), ir.step(), null, kind, promoted, rests);
     }
 
     /** Folds a branch whose value depends on nothing but the step column into a compile-time step/value relation. */
@@ -293,7 +300,8 @@ public record TranslationContext(
         var plan = PromqlLogicalPlanBuilder.buildLocalRelation(cmd);
         var step = plan.output().getFirst();
         var value = result.value().transformUp(Attribute.class, attr -> attr.semanticEquals(stepAttr) ? step : attr);
-        return new IntermediateResult(plan, result.header(), value, step, result.pendingFilter(), Kind.CONSTANT);
+        // The folded relation carries no label columns at all.
+        return new IntermediateResult(plan, result.header(), value, step, result.pendingFilter(), Kind.CONSTANT, Set.of(), Set.of());
     }
 
     /**
@@ -309,8 +317,7 @@ public record TranslationContext(
     }
 
     /**
-     * The table a {@code without} regroup exposes: the child columns surviving the dropped labels. Under a packed
-     * column the labels are derived columns, so only those the enclosing translation asks for are carried; a finite
+     * The table a {@code without} regroup exposes: the child columns surviving the dropped labels. A finite
      * child keeps every remaining label because they are its label set.
      */
     public TranslationConstraint regroupWithout(TranslationConstraint child, List<String> keys) {
@@ -327,7 +334,7 @@ public record TranslationContext(
     public IntermediateResult collapse(IntermediateResult input, TranslationConstraint header, Expression function) {
         assert input.kind().afterInitialAggregation == false : "invariant: a collapse takes a raw table";
         Alias value = new Alias(function.source(), cmd.valueColumnName(), function);
-        return table(emitCollapse(input, header, value), input, header, value);
+        return emitLegacyCollapse(input, header, value);
     }
 
     /**
@@ -337,18 +344,14 @@ public record TranslationContext(
     public IntermediateResult regroup(IntermediateResult input, TranslationConstraint header, boolean packed, Expression function) {
         assert input.kind().afterInitialAggregation : "invariant: a regroup takes a collapsed table";
         Alias value = new Alias(function.source(), cmd.valueColumnName(), function);
-        return table(emitRegroup(input, header, value, header.isOpen() || packed), input, header, value);
-    }
-
-    private static IntermediateResult table(LogicalPlan plan, IntermediateResult input, TranslationConstraint header, Alias value) {
-        return new IntermediateResult(plan, header, value.toAttribute(), input.step(), input.pendingFilter(), Kind.AFTER_INITIAL_AGGREGATE);
+        return emitLegacyRegroup(input, header, value, header.isOpen() || packed);
     }
 
     /**
      * The innermost aggregate owns the physical {@code _timeseries} grouping and materializes every packed column in
      * the header over that column's own skip set.
      */
-    private LogicalPlan emitCollapse(IntermediateResult input, TranslationConstraint header, Alias value) {
+    private IntermediateResult emitLegacyCollapse(IntermediateResult input, TranslationConstraint header, Alias value) {
         Source source = cmd.promqlPlan().source();
         LogicalPlan plan = input.plan();
         boolean groupsBySeries = header.isOpen() || header.labels().isEmpty() == false;
@@ -366,11 +369,12 @@ public record TranslationContext(
             value = value.replaceChild(new Values(agg.source(), agg));
         }
 
-        // Every packing is materialized under its derived name, finest first, and every label the relation has is a
-        // key too. Every column is functionally dependent on the finest packing, so grouping by all of them
+        // Every rest is materialized under its derived name, finest first, and every promoted label the relation
+        // has is a key too. Every column is functionally dependent on the finest rest, so grouping by all of them
         // preserves per-series granularity while making the full header available to the surrounding query.
         var groupKeys = new ArrayList<NamedExpression>();
         var outKeys = new ArrayList<NamedExpression>();
+        var rests = new ArrayList<LabelColumn>();
         for (Set<String> skip : finestFirst(header.skips())) {
             List<Expression> excluded = skip.stream().<Expression>map(label -> {
                 Attribute resolved = find(plan.output(), label);
@@ -379,6 +383,8 @@ public record TranslationContext(
             Alias packing = new Alias(source, mapOpen(skip), new TimeSeriesWithout(source, excluded));
             groupKeys.add(packing);
             outKeys.add(packing.toAttribute());
+            // The rest reads its skip set straight from the source, so it is tracked as a source-backed column.
+            rests.add(new SourcePacking(packing.toAttribute(), skip));
         }
         for (String label : header.labels()) {
             Attribute carrier = find(plan.output(), label);
@@ -388,7 +394,7 @@ public record TranslationContext(
             }
         }
 
-        return new TimeSeriesAggregate(
+        var collapsed = new TimeSeriesAggregate(
             source,
             plan,
             groupings(stepBucketAlias, groupKeys),
@@ -397,6 +403,16 @@ public record TranslationContext(
             time,
             TimeSeriesAggregate.Origin.PROMQL_COMMAND
         );
+        return new IntermediateResult(
+            collapsed,
+            header,
+            value.toAttribute(),
+            input.step(),
+            input.pendingFilter(),
+            Kind.AFTER_INITIAL_AGGREGATE,
+            bindPromoted(collapsed, header),
+            Set.copyOf(rests)
+        );
     }
 
     /**
@@ -404,7 +420,12 @@ public record TranslationContext(
      * grouping columns. A packed regroup additionally packs dimensions before aggregation to prevent multi-valued
      * dimensions from splitting rows and double-counting, then unpacks them afterwards.
      */
-    private LogicalPlan emitRegroup(IntermediateResult input, TranslationConstraint header, Alias value, boolean requiresPacking) {
+    private IntermediateResult emitLegacyRegroup(
+        IntermediateResult input,
+        TranslationConstraint header,
+        Alias value,
+        boolean requiresPacking
+    ) {
         Source source = cmd.source();
         Attribute step = input.step();
         LogicalPlan plan = input.plan();
@@ -435,11 +456,13 @@ public record TranslationContext(
         }
 
         if (requiresPacking == false) {
-            return new Aggregate(source, plan, groupings(step, keys), aggregates(value, step, keys));
+            plan = new Aggregate(source, plan, groupings(step, keys), aggregates(value, step, keys));
+            return regrouped(plan, input, header, value);
         }
         // TranslateTimeSeriesAggregate unpacks the inner TSA's dimensions and this regroup re-packs them.
         if (keys.isEmpty()) {
-            return new Aggregate(source, plan, groupings(step, List.of()), aggregates(value, step, List.of()));
+            plan = new Aggregate(source, plan, groupings(step, List.of()), aggregates(value, step, List.of()));
+            return regrouped(plan, input, header, value);
         }
         Attribute packedAttribute = PackDims.newPackedAttribute(source);
         PackDims packDims = new PackDims(source, plan, keys, packedAttribute);
@@ -458,7 +481,24 @@ public record TranslationContext(
         UnpackDims unpackDims = new UnpackDims(source, agg, packedGrouping.toAttribute(), unpackedDims);
         List<NamedExpression> projections = new ArrayList<>(List.of(value.toAttribute(), step));
         projections.addAll(unpackedDims);
-        return new Project(source, unpackDims, projections);
+        return regrouped(new Project(source, unpackDims, projections), input, header, value);
+    }
+
+    /**
+     * The regrouped table binds its promoted labels from the regrouped plan and keeps the input's rests that survive
+     * in it. Regroups genuinely drop columns, so survivors are retained rather than propagated.
+     */
+    private static IntermediateResult regrouped(LogicalPlan plan, IntermediateResult input, TranslationConstraint header, Alias value) {
+        return new IntermediateResult(
+            plan,
+            header,
+            value.toAttribute(),
+            input.step(),
+            input.pendingFilter(),
+            Kind.AFTER_INITIAL_AGGREGATE,
+            bindPromoted(plan, header),
+            IntermediateResult.retain(plan, input.rests())
+        );
     }
 
     /** Projects the plan to the command's declared output, re-aliasing columns that match by name but not by id. */
@@ -621,6 +661,9 @@ public record TranslationContext(
      * regroups, the command coda) compose them by their declared columns. Mid-descent the value is a (possibly not
      * yet materialized) expression parents compose into larger expressions; a finished table's value is a defined
      * column ({@link #valueColumn()}).
+     * <p>
+     * Labels use a dual representation like ClickHouse: promoted labels carried directly plus {@code rest} columns
+     * holding every remaining label as a packed/dynamic dictionary. A {@code rest} may overlap the promoted names.
      */
     public record IntermediateResult(
         /* Output ESQL plan: the source relation (cmd.child()) with this node's operators stacked on top. */
@@ -634,7 +677,11 @@ public record TranslationContext(
         /* Label matcher predicate; flows up until pushed to the relation or folded into an aggregate filter. */
         Expression pendingFilter,
         /* The translator tracks what it built instead of inspecting the plan. */
-        Kind kind
+        Kind kind,
+        /* Promoted labels carried directly, in header order. */
+        Set<PromotedColumn> promoted,
+        /* Rests: packed/dynamic dictionaries of the remaining labels, one per exclusion set. */
+        Set<LabelColumn> rests
     ) {
         /** The lifecycle of an intermediate result. A constant is always a finished (aggregation-free) local relation. */
         public enum Kind {
@@ -653,9 +700,21 @@ public record TranslationContext(
             }
         }
 
+        public IntermediateResult {
+            promoted = Collections.unmodifiableSet(new LinkedHashSet<>(promoted));
+            rests = Set.copyOf(rests);
+            assert promoted.stream().map(PromotedColumn::attribute).allMatch(a -> plan.outputSet().contains(a))
+                : "every promoted label must belong to the plan output";
+            assert promoted.stream().map(PromotedColumn::name).distinct().count() == promoted.size()
+                : "at most one promoted column per name";
+            assert rests.stream().map(LabelColumn::attribute).allMatch(a -> plan.outputSet().contains(a))
+                : "every rest column must belong to the plan output";
+            // No disjointness check: a rest may overlap the promoted names.
+        }
+
         /** A raw input whose value may still contain per-series aggregate expressions. */
         public IntermediateResult(LogicalPlan plan, TranslationConstraint header, Expression value, Attribute step) {
-            this(plan, header, value, step, null, Kind.BEFORE_INITIAL_AGGREGATE);
+            this(plan, header, value, step, null, Kind.BEFORE_INITIAL_AGGREGATE, Set.of(), Set.of());
         }
 
         /** A raw input carrying a selector predicate until source filtering or aggregate assembly consumes it. */
@@ -666,12 +725,61 @@ public record TranslationContext(
             Attribute step,
             Expression selectorFilter
         ) {
-            this(plan, header, value, step, selectorFilter, Kind.BEFORE_INITIAL_AGGREGATE);
+            this(plan, header, value, step, selectorFilter, Kind.BEFORE_INITIAL_AGGREGATE, Set.of(), Set.of());
+        }
+
+        /** A raw input carrying a selector predicate and its dual label columns (promoted plus rests). */
+        public IntermediateResult(
+            LogicalPlan plan,
+            TranslationConstraint header,
+            Expression value,
+            Attribute step,
+            Expression selectorFilter,
+            Set<PromotedColumn> promoted,
+            Set<LabelColumn> rests
+        ) {
+            this(plan, header, value, step, selectorFilter, Kind.BEFORE_INITIAL_AGGREGATE, promoted, rests);
         }
 
         /** This table rebuilt around a new plan, header and value, keeping its other properties. */
         public IntermediateResult with(LogicalPlan plan, TranslationConstraint header, Expression value) {
-            return new IntermediateResult(plan, header, value, step, pendingFilter, kind);
+            return new IntermediateResult(plan, header, value, step, pendingFilter, kind, promoted, rests);
+        }
+
+        /**
+         * Keeps the tracked rests still present in a merged plan. Merges (binary operators, joins) genuinely drop
+         * some inputs' materialized columns, so merge sites retain rather than propagate blindly; producing sites must
+         * still account for every column exactly, which the constructor asserts.
+         */
+        public static Set<LabelColumn> retain(LogicalPlan plan, Set<LabelColumn> rests) {
+            Set<Attribute> output = Set.copyOf(plan.output());
+            return rests.stream().filter(column -> output.contains(column.attribute())).collect(Collectors.toUnmodifiableSet());
+        }
+
+        /**
+         * Keeps the promoted labels still present in a merged plan, in declaration order. Like {@link #retain},
+         * merges drop inputs' columns, so merge sites retain rather than propagate blindly.
+         */
+        public static Set<PromotedColumn> retainPromoted(LogicalPlan plan, Set<PromotedColumn> promoted) {
+            Set<Attribute> output = Set.copyOf(plan.output());
+            var retained = new LinkedHashSet<PromotedColumn>();
+            for (PromotedColumn column : promoted) {
+                if (output.contains(column.attribute())) {
+                    retained.add(column);
+                }
+            }
+            return Collections.unmodifiableSet(retained);
+        }
+
+        /** This table rebuilt with a new dual label assignment (promoted plus rests). */
+        public IntermediateResult with(
+            LogicalPlan plan,
+            TranslationConstraint header,
+            Expression value,
+            Set<PromotedColumn> promoted,
+            Set<LabelColumn> rests
+        ) {
+            return new IntermediateResult(plan, header, value, step, pendingFilter, kind, promoted, rests);
         }
 
         /** The value as a defined column; only valid on a finished table. */
@@ -679,13 +787,23 @@ public record TranslationContext(
             return (Attribute) value;
         }
 
-        /** The attribute carrying a label in this table's plan, or null when the table lacks it. */
+        /** The attribute carrying a promoted label, or null when the table lacks it. */
         public Attribute label(String name) {
+            for (PromotedColumn column : promoted) {
+                if (column.name().equals(name)) {
+                    return column.attribute();
+                }
+            }
             return find(plan.output(), name);
         }
 
-        /** The attribute carrying a packing in this table's plan, or null when the table lacks it. */
+        /** The attribute carrying a rest with this exclusion set, or null when the table lacks it. */
         public Attribute packed(Set<String> skip) {
+            for (LabelColumn rest : rests) {
+                if (rest.excluded().equals(skip)) {
+                    return rest.attribute();
+                }
+            }
             return find(plan.output(), mapOpen(skip));
         }
     }
@@ -741,5 +859,21 @@ public record TranslationContext(
             }
         }
         return bareMatch;
+    }
+
+    /**
+     * Binds the promoted labels of a header to the plan columns carrying them, in header order. Labels the plan
+     * lacks are omitted; consumers null-fill them. A rest may still carry an omitted or bound label.
+     */
+    public static Set<PromotedColumn> bindPromoted(LogicalPlan plan, TranslationConstraint header) {
+        var bound = new LinkedHashSet<PromotedColumn>();
+        List<Attribute> output = plan.output();
+        for (String name : header.labels()) {
+            Attribute carrier = find(output, name);
+            if (carrier != null) {
+                bound.add(new PromotedColumn(name, carrier));
+            }
+        }
+        return Collections.unmodifiableSet(bound);
     }
 }

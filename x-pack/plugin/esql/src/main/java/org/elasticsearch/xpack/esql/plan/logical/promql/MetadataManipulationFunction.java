@@ -31,6 +31,7 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.Inter
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult.Kind;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationConstraint.finite;
@@ -199,13 +200,28 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
             plan = new Project(context.cmd().source(), plan, unshadowed);
         }
         TranslationConstraint header = union(aggregated.header(), finite(List.of(name)));
+        var promoted = new LinkedHashSet<PromotedColumn>();
+        for (String label : header.labels()) {
+            if (label.equals(name)) {
+                promoted.add(new PromotedColumn(name, derived.toAttribute()));
+            } else {
+                for (PromotedColumn column : aggregated.promoted()) {
+                    if (column.name().equals(label)) {
+                        promoted.add(column);
+                        break;
+                    }
+                }
+            }
+        }
         return new IntermediateResult(
             plan,
             header,
             aggregated.value(),
             aggregated.step(),
             aggregated.pendingFilter(),
-            Kind.AFTER_INITIAL_AGGREGATE
+            Kind.AFTER_INITIAL_AGGREGATE,
+            IntermediateResult.retainPromoted(plan, promoted),
+            IntermediateResult.retain(plan, aggregated.rests())
         );
     }
 
