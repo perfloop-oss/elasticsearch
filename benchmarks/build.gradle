@@ -119,6 +119,7 @@ dependencies {
   runtimeOnly "net.sf.jopt-simple:jopt-simple:${versions.jopt_simple}"
   runtimeOnly "org.apache.commons:commons-math3:${versions.commons_math3}"
 
+  implementation(project(':test:framework'))
   testImplementation(project(':test:framework'))
 }
 
