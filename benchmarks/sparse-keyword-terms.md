@@ -2,7 +2,7 @@
 
 Status: recorded proof with reproduction commands, October 4, 2026.
 
-Found with [Perfloop](https://perfloop.ai/t/oss/case_vycxvq13jv).
+Found with [Perfloop](https://app.perfloop.ai/t/oss/case_vycxvq13jv).
 
 This branch contains the measured repair and the exact JMH source used for
 its accepted comparison. The benchmark uses a retained 100,000-term reader
